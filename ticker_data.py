@@ -9,6 +9,9 @@ is the only caller, and wraps these with st.cache_data itself.
 
 from __future__ import annotations
 
+import io
+import logging
+import os
 import re
 from datetime import date
 
@@ -16,6 +19,8 @@ import pandas as pd
 import requests
 import yfinance as yf
 from rapidfuzz import fuzz
+
+logger = logging.getLogger(__name__)
 
 COMPANY_TICKERS_URL = "https://www.sec.gov/files/company_tickers.json"
 
@@ -63,6 +68,34 @@ def load_company_tickers() -> list[dict]:
             "cik": str(entry["cik_str"]).zfill(10),
         }
         for entry in raw.values()
+    ]
+
+
+SP500_CONSTITUENTS_URL = (
+    "https://raw.githubusercontent.com/datasets/s-and-p-500-companies/master/data/constituents.csv"
+)
+
+
+def load_sp500_constituents() -> list[dict]:
+    """Fetch the free, keyless S&P 500 constituents CSV (GICS Sector/Sub-
+    Industry per ticker, plus a CIK column that plugs directly into
+    get_fundamentals_history) -- the sector/industry -> ticker-list source
+    for Peer Analysis. Callers should fetch this once (e.g. behind
+    st.cache_data) rather than re-fetching per interaction, same as
+    load_company_tickers.
+    """
+    response = requests.get(SP500_CONSTITUENTS_URL, timeout=10)
+    response.raise_for_status()
+    df = pd.read_csv(io.StringIO(response.text))
+    return [
+        {
+            "ticker": row["Symbol"],
+            "name": row["Security"],
+            "sector": row["GICS Sector"],
+            "sub_industry": row["GICS Sub-Industry"],
+            "cik": str(row["CIK"]).zfill(10),
+        }
+        for _, row in df.iterrows()
     ]
 
 
@@ -290,6 +323,75 @@ def get_historicals(ticker: str, start: date, end: date) -> pd.DataFrame:
     return df[_HISTORICALS_COLUMNS]
 
 
+def get_multi_ticker_historicals(
+    tickers: list[str], start: date, end: date, *, fetch_historicals=get_historicals
+) -> dict[str, pd.DataFrame]:
+    """Daily historicals (see get_historicals) for each of `tickers`,
+    keyed by ticker. A ticker whose fetch fails (bad symbol, transient
+    yfinance error) is logged and simply omitted from the result rather
+    than failing the whole batch -- see Peer Analysis spec.md's per-peer
+    graceful degradation decision.
+    """
+    result: dict[str, pd.DataFrame] = {}
+    for ticker in tickers:
+        try:
+            result[ticker] = fetch_historicals(ticker, start, end)
+        except Exception:
+            logger.exception("Historicals fetch failed for peer %s", ticker)
+    return result
+
+
+def build_peer_price_frame(histories: dict[str, pd.DataFrame]) -> pd.DataFrame:
+    """Reshape per-ticker historicals (see get_multi_ticker_historicals)
+    into one wide DataFrame -- index the union of every peer's dates,
+    one column per ticker holding its AdjClose. A peer with a shorter
+    history has NaN before its first available date rather than the
+    whole frame being truncated down to the shortest peer -- see
+    Peer Analysis spec.md's "peers just start later" decision. Pure
+    reshape, no I/O.
+    """
+    if not histories:
+        return pd.DataFrame()
+    return pd.DataFrame({ticker: history["AdjClose"] for ticker, history in histories.items()}).sort_index()
+
+
+_TRADING_DAYS_PER_YEAR = 252
+
+
+def compute_peer_performance_stats(price_frame: pd.DataFrame) -> pd.DataFrame:
+    """Total return, annualized volatility, and max drawdown per ticker
+    column of `price_frame` (see build_peer_price_frame), computed over
+    whatever range the caller has already restricted the frame to. Pure
+    computation, no I/O. A ticker with fewer than 2 valid (non-NaN)
+    prices in range gets NaN for every stat rather than a crash or a
+    misleading number -- see Peer Analysis spec.md's Ticket 04.
+    """
+    rows = []
+    for ticker in price_frame.columns:
+        series = price_frame[ticker].dropna()
+        if len(series) < 2:
+            rows.append(
+                {"Ticker": ticker, "Total Return (%)": float("nan"), "Volatility (%)": float("nan"), "Max Drawdown (%)": float("nan")}
+            )
+            continue
+
+        total_return = (series.iloc[-1] - series.iloc[0]) / series.iloc[0] * 100
+        daily_returns = series.pct_change().dropna()
+        volatility = daily_returns.std() * (_TRADING_DAYS_PER_YEAR**0.5) * 100
+        max_drawdown = (series / series.cummax() - 1).min() * 100
+
+        rows.append(
+            {
+                "Ticker": ticker,
+                "Total Return (%)": total_return,
+                "Volatility (%)": volatility,
+                "Max Drawdown (%)": max_drawdown,
+            }
+        )
+
+    return pd.DataFrame(rows).set_index("Ticker")
+
+
 _SNAPSHOT_FIELDS = {
     "market_cap": "marketCap",
     "trailing_pe": "trailingPE",
@@ -352,3 +454,300 @@ def resolve_ticker(query: str, tickers: list[dict], limit: int = 8) -> list[dict
 
     scored.sort(key=lambda pair: pair[0], reverse=True)
     return [entry for _, entry in scored[:limit]]
+
+
+_FINNHUB_METRIC_URL = "https://finnhub.io/api/v1/stock/metric"
+
+
+def get_fundamentals_from_finnhub(ticker: str) -> dict:
+    """Current Fundamentals snapshot for `ticker` from Finnhub's free-tier
+    basic-financials endpoint (stock/metric?metric=all), shaped to the
+    same keys build_fundamentals_pivot's other sources use. Requires
+    FINNHUB_API_KEY; raises if it's unset, so build_fundamentals_pivot
+    catches that the same way it catches any other per-source failure
+    (see spec.md's "API keys" decision).
+
+    marketCapitalization, 52WeekHigh/Low, peTTM, and
+    dividendYieldIndicatedAnnual are confirmed against Finnhub's
+    documented example responses. epsInclExtraItemsTTM (Finnhub's "EPS
+    TTM including extra items" figure) and the assumption that its
+    dividend yield is already a percent, matching yfinance's convention,
+    are the best-available reading and not confirmed against a live
+    response -- if either looks off, check here first.
+    """
+    api_key = os.environ.get("FINNHUB_API_KEY")
+    if not api_key:
+        raise RuntimeError("FINNHUB_API_KEY is not set")
+
+    response = requests.get(
+        _FINNHUB_METRIC_URL,
+        params={"symbol": ticker, "metric": "all", "token": api_key},
+        timeout=10,
+    )
+    response.raise_for_status()
+    metric = response.json().get("metric") or {}
+
+    market_cap = metric.get("marketCapitalization")  # Finnhub reports this in millions
+    return {
+        "market_cap": market_cap * 1e6 if market_cap is not None else None,
+        "trailing_pe": metric.get("peTTM"),
+        "eps": metric.get("epsInclExtraItemsTTM"),
+        "dividend_yield": metric.get("dividendYieldIndicatedAnnual"),
+        "fifty_two_week_high": metric.get("52WeekHigh"),
+        "fifty_two_week_low": metric.get("52WeekLow"),
+    }
+
+
+_ALPHA_VANTAGE_URL = "https://www.alphavantage.co/query"
+
+
+def get_fundamentals_from_alpha_vantage(ticker: str) -> dict:
+    """Current Fundamentals snapshot for `ticker` from Alpha Vantage's
+    free-tier OVERVIEW endpoint, shaped to build_fundamentals_pivot's
+    metric keys. Requires ALPHAVANTAGE_API_KEY; raises if it's unset (see
+    get_fundamentals_from_finnhub). Also raises on a rate-limited or
+    invalid-key response -- Alpha Vantage returns HTTP 200 with an
+    {"Information": ...} or {"Note": ...} body instead of real fields in
+    that case, which has no "Symbol" key to key off of.
+    """
+    api_key = os.environ.get("ALPHAVANTAGE_API_KEY")
+    if not api_key:
+        raise RuntimeError("ALPHAVANTAGE_API_KEY is not set")
+
+    response = requests.get(
+        _ALPHA_VANTAGE_URL,
+        params={"function": "OVERVIEW", "symbol": ticker, "apikey": api_key},
+        timeout=10,
+    )
+    response.raise_for_status()
+    data = response.json()
+    if "Symbol" not in data:
+        raise ValueError(f"Alpha Vantage returned no OVERVIEW data for {ticker!r}: {data}")
+
+    def num(key: str) -> float | None:
+        # Every field comes back as a string, and a missing one as the
+        # literal string "None" rather than an absent key.
+        raw = data.get(key)
+        if raw in (None, "None", "-", ""):
+            return None
+        try:
+            return float(raw)
+        except ValueError:
+            return None
+
+    def text(key: str) -> str | None:
+        raw = data.get(key)
+        return raw if raw not in (None, "None", "") else None
+
+    dividend_yield = num("DividendYield")
+    return {
+        "market_cap": num("MarketCapitalization"),
+        "trailing_pe": num("PERatio"),
+        "forward_pe": num("ForwardPE"),
+        "eps": num("EPS"),
+        # Reported as a fraction of price (e.g. 0.0057 = 0.57%);
+        # normalized here to the percent convention the other sources use.
+        "dividend_yield": dividend_yield * 100 if dividend_yield is not None else None,
+        "sector": text("Sector"),
+        "industry": text("Industry"),
+        "fifty_two_week_high": num("52WeekHigh"),
+        "fifty_two_week_low": num("52WeekLow"),
+        "revenue_fy": num("RevenueTTM"),
+    }
+
+
+# One row per metric, in display order; the key is what each source
+# function above (and _snapshot/_history below) populates its dict with.
+_PIVOT_METRICS: list[tuple[str, str]] = [
+    ("sector", "Sector"),
+    ("industry", "Industry"),
+    ("market_cap", "Market cap"),
+    ("trailing_pe", "Trailing P/E"),
+    ("forward_pe", "Forward P/E"),
+    ("eps", "EPS"),
+    ("dividend_yield", "Dividend yield (%)"),
+    ("fifty_two_week_high", "52-week high"),
+    ("fifty_two_week_low", "52-week low"),
+    # Not FY-only despite the key name -- Alpha Vantage's RevenueTTM lands
+    # here too (see get_fundamentals_from_alpha_vantage), which is why the
+    # label stays plain and the FY-vs-TTM distinction is called out in
+    # app.py's Fundamentals caption instead of in this label.
+    ("revenue_fy", "Revenue"),
+    ("net_income_fy", "Net income"),
+]
+
+_PIVOT_PLACEHOLDER = "—"
+
+
+def _format_money(value: float) -> str:
+    sign = "-" if value < 0 else ""
+    magnitude = abs(value)
+    if magnitude >= 1e12:
+        return f"{sign}${magnitude / 1e12:.2f}T"
+    if magnitude >= 1e9:
+        return f"{sign}${magnitude / 1e9:.2f}B"
+    if magnitude >= 1e6:
+        return f"{sign}${magnitude / 1e6:.1f}M"
+    return f"{sign}${magnitude:,.2f}"
+
+
+def _format_pivot_value(key: str, value):
+    if key in ("sector", "industry"):
+        return str(value)
+    if key in ("market_cap", "revenue_fy", "net_income_fy"):
+        return _format_money(value)
+    if key in ("trailing_pe", "forward_pe"):
+        return f"{value:.1f}×"
+    if key == "eps":
+        return f"${value:.2f}"
+    if key == "dividend_yield":
+        return f"{value:.2f}%"
+    if key in ("fifty_two_week_high", "fifty_two_week_low"):
+        return f"${value:,.2f}"
+    return str(value)
+
+
+def _pivot_cell(row: dict, key: str):
+    value = row.get(key)
+    if value is None or pd.isna(value):
+        return _PIVOT_PLACEHOLDER
+    return _format_pivot_value(key, value)
+
+
+def build_fundamentals_pivot(
+    ticker: str,
+    cik: str | None,
+    price_history: pd.DataFrame,
+    *,
+    fetch_snapshot=get_fundamentals_snapshot,
+    fetch_history=get_fundamentals_history,
+    fetch_finnhub=get_fundamentals_from_finnhub,
+    fetch_alpha_vantage=get_fundamentals_from_alpha_vantage,
+) -> pd.DataFrame:
+    """One row per Fundamentals metric, one column per source that
+    responded -- see spec.md's Multi-source Fundamentals decision. Each
+    source is fetched and shaped independently; a failure in one (missing
+    key, timeout, rate-limit, bad response) drops only that column, never
+    the whole table. A metric a given source doesn't report is "—", not a
+    blank cell or zero.
+
+    The `fetch_*` parameters default to this module's own fetchers but
+    accept overrides so app.py can pass in its st.cache_data-wrapped
+    versions (each with its own TTL -- Alpha Vantage needs a much longer
+    one than the others, per spec.md's rate-limit decision) without this
+    function importing Streamlit.
+    """
+    columns: dict[str, dict] = {}
+
+    try:
+        snapshot = fetch_snapshot(ticker)
+        columns["yfinance"] = {
+            "sector": snapshot.get("sector"),
+            "industry": snapshot.get("industry"),
+            "market_cap": snapshot.get("market_cap"),
+            "trailing_pe": snapshot.get("trailing_pe"),
+            "forward_pe": snapshot.get("forward_pe"),
+            "eps": snapshot.get("eps_ttm"),
+            "dividend_yield": snapshot.get("dividend_yield"),
+            "fifty_two_week_high": snapshot.get("fifty_two_week_high"),
+            "fifty_two_week_low": snapshot.get("fifty_two_week_low"),
+        }
+    except Exception:
+        logger.exception("yfinance fundamentals fetch failed for %s", ticker)
+
+    if cik is not None:
+        try:
+            history = fetch_history(cik, price_history)
+            if not history.empty:
+                latest = history.loc[history.index.max()]
+                # Revenue already carries the bank-appropriate substitution
+                # (RevenuesNetOfInterestExpense) from get_fundamentals_history
+                # itself -- this row inherits it automatically, per spec.md's
+                # "stays source-scoped" decision.
+                columns["SEC EDGAR"] = {
+                    "market_cap": latest.get("MarketCap"),
+                    "trailing_pe": latest.get("TrailingPE"),
+                    "eps": latest.get("EPS"),
+                    "revenue_fy": latest.get("Revenue"),
+                    "net_income_fy": latest.get("NetIncome"),
+                }
+        except Exception:
+            logger.exception("SEC EDGAR fundamentals fetch failed for CIK %s", cik)
+
+    if os.environ.get("FINNHUB_API_KEY"):
+        try:
+            columns["Finnhub"] = fetch_finnhub(ticker)
+        except Exception:
+            logger.exception("Finnhub fundamentals fetch failed for %s", ticker)
+
+    if os.environ.get("ALPHAVANTAGE_API_KEY"):
+        try:
+            columns["Alpha Vantage"] = fetch_alpha_vantage(ticker)
+        except Exception:
+            logger.exception("Alpha Vantage fundamentals fetch failed for %s", ticker)
+
+    index = pd.Index([label for _, label in _PIVOT_METRICS], name="Metric")
+    data = {
+        source: [_pivot_cell(row, key) for key, _ in _PIVOT_METRICS]
+        for source, row in columns.items()
+    }
+    return pd.DataFrame(data, index=index)
+
+
+# Fixed fallback order for collapsing a peer's per-source pivot row into a
+# single value -- yfinance first (fastest, no daily cap), then SEC EDGAR
+# (free, keyless, but snapshot fields only reach market cap/trailing P/E),
+# then Finnhub, then Alpha Vantage last (25 requests/day free-tier cap,
+# shared app-wide with the single-ticker Fundamentals section). See Peer
+# Analysis spec.md's fundamentals-table decision.
+_PEER_FUNDAMENTALS_SOURCE_PRIORITY = ["yfinance", "SEC EDGAR", "Finnhub", "Alpha Vantage"]
+
+
+def build_peer_fundamentals_pivot(
+    tickers: list[str],
+    cik_by_ticker: dict[str, str | None],
+    histories: dict[str, pd.DataFrame],
+    *,
+    fetch_snapshot=get_fundamentals_snapshot,
+    fetch_history=get_fundamentals_history,
+    fetch_finnhub=get_fundamentals_from_finnhub,
+    fetch_alpha_vantage=get_fundamentals_from_alpha_vantage,
+) -> pd.DataFrame:
+    """One row per Fundamentals metric, one column per peer ticker -- the
+    Peer Analysis comparison table. For each ticker, reuses the existing
+    build_fundamentals_pivot (the same 4-source cross-check the
+    single-ticker Fundamentals section uses) to get a metric x source
+    table, then collapses each metric to a single value by trying sources
+    in _PEER_FUNDAMENTALS_SOURCE_PRIORITY order and taking the first
+    non-placeholder value. A ticker missing from `histories` (its own
+    historicals fetch failed upstream) falls back to an empty price
+    history rather than raising -- SEC EDGAR's revenue/net income/EPS
+    rows are unaffected, only its market-cap/trailing-P/E derivation
+    (which needs a price series) comes back empty for that ticker.
+    """
+    columns: dict[str, pd.Series] = {}
+
+    for ticker in tickers:
+        price_history = histories.get(ticker, pd.DataFrame(columns=["AdjClose"]))
+        try:
+            per_source = build_fundamentals_pivot(
+                ticker, cik_by_ticker.get(ticker), price_history,
+                fetch_snapshot=fetch_snapshot, fetch_history=fetch_history,
+                fetch_finnhub=fetch_finnhub, fetch_alpha_vantage=fetch_alpha_vantage,
+            )
+        except Exception:
+            logger.exception("Peer fundamentals fetch failed for %s", ticker)
+            per_source = pd.DataFrame(index=pd.Index([label for _, label in _PIVOT_METRICS], name="Metric"))
+
+        collapsed = []
+        for label in per_source.index:
+            value = _PIVOT_PLACEHOLDER
+            for source in _PEER_FUNDAMENTALS_SOURCE_PRIORITY:
+                if source in per_source.columns and per_source.loc[label, source] != _PIVOT_PLACEHOLDER:
+                    value = per_source.loc[label, source]
+                    break
+            collapsed.append(value)
+        columns[ticker] = pd.Series(collapsed, index=per_source.index)
+
+    index = pd.Index([label for _, label in _PIVOT_METRICS], name="Metric")
+    return pd.DataFrame(columns, index=index)

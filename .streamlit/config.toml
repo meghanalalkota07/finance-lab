@@ -1,0 +1,13 @@
+# Hallmark · Aurora theme — dark base so Streamlit's own native widgets
+# (the chart-type radio, the Custom-range date picker, the dataframe grid)
+# pick up the palette natively instead of fighting hand-rolled CSS overrides.
+# Fonts and finer component voice (buttons, segmented control, hero) are
+# still layered on top via THEME_CSS in app.py. Keep these hex values in
+# sync with the AURORA dict / :root tokens there if the palette changes.
+[theme]
+base = "dark"
+primaryColor = "#37D59F"
+backgroundColor = "#070B14"
+secondaryBackgroundColor = "#0F141D"
+textColor = "#E7EBF2"
+borderColor = "#171D27"

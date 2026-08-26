@@ -11,6 +11,7 @@ dependencies = [
     "plotly>=5.20",
     "requests>=2.31",
     "rapidfuzz>=3.9",
+    "python-dotenv>=1.0",
 ]
 
 [project.optional-dependencies]
