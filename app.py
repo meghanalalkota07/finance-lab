@@ -68,12 +68,14 @@ cached_get_fundamentals_from_alpha_vantage = st.cache_data(ttl=24 * 3600)(get_fu
 # source) change rarely -- same 24h TTL as the SEC ticker directory. See
 # .scratch/peer-analysis/spec.md.
 cached_load_sp500_constituents = st.cache_data(ttl=24 * 3600)(load_sp500_constituents)
-cached_get_multi_ticker_historicals = st.cache_data(ttl=3600)(get_multi_ticker_historicals)
-# Same rationale as the Alpha Vantage snapshot cache above, but here it
-# covers the whole peer set: re-toggling the chart's View radio (a full
-# script rerun) shouldn't risk a fresh Alpha Vantage call landing outside
-# its per-source cache window just because this outer call wasn't cached.
-cached_build_peer_fundamentals_pivot = st.cache_data(ttl=3600)(build_peer_fundamentals_pivot)
+# get_multi_ticker_historicals and build_peer_fundamentals_pivot are
+# deliberately NOT wrapped in st.cache_data themselves -- both take a
+# cached function (e.g. cached_get_historicals) as an argument, and
+# Streamlit's cache hasher can't hash a CachedFunc object
+# (UnhashableParamError). Same reason build_fundamentals_pivot above
+# isn't cached at its own level either: the real caching happens at the
+# leaf fetchers passed in as fetch_* kwargs, which is where the actual
+# I/O -- and the benefit of caching it -- lives.
 
 # Quick date-range presets for the Historicals chart. "Custom" isn't in
 # here -- it's handled separately since it needs a date_input, not a
@@ -955,7 +957,7 @@ def render_peer_analysis_tab(historicals_seed: tuple[str, str | None, pd.DataFra
     # range can usefully go -- the earliest date across ALL selected peers
     # (i.e. as far back as the longest-listed peer goes), not truncated to
     # the newest peer's start date. See spec.md's Ticket 03.
-    wide_histories = cached_get_multi_ticker_historicals(
+    wide_histories = get_multi_ticker_historicals(
         selected, date.today() - timedelta(days=FULL_HISTORY_FETCH_DAYS), date.today(),
         fetch_historicals=cached_get_historicals,
     )
@@ -999,7 +1001,7 @@ def render_peer_analysis_tab(historicals_seed: tuple[str, str | None, pd.DataFra
 
     st.markdown("<div class='te-group-title'>Fundamentals</div>", unsafe_allow_html=True)
     pivot = fetch_or_none(
-        cached_build_peer_fundamentals_pivot, selected, cik_by_ticker, histories,
+        build_peer_fundamentals_pivot, selected, cik_by_ticker, histories,
         fetch_snapshot=cached_get_fundamentals_snapshot, fetch_history=cached_get_fundamentals_history,
         fetch_finnhub=cached_get_fundamentals_from_finnhub, fetch_alpha_vantage=cached_get_fundamentals_from_alpha_vantage,
         error_message="Peer fundamentals are temporarily unavailable.",
