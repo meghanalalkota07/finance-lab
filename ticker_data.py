@@ -14,6 +14,7 @@ import logging
 import os
 import re
 from datetime import date
+from xml.etree import ElementTree
 
 import pandas as pd
 import requests
@@ -134,6 +135,124 @@ _SHARES_CHAIN = [
 ]
 
 
+EDGAR_SUBMISSIONS_URL = "https://data.sec.gov/submissions/CIK{cik}.json"
+
+
+def list_10k_filings(cik: str) -> list[dict]:
+    """The filer's most recent 10-K filings (up to 5), most-recent-first --
+    the filing-discovery step behind 10-K Reader's Exact-as-filed view.
+    Free, keyless SEC EDGAR endpoint. A filer with no 10-K on record (an
+    ETF, a foreign private issuer filing 20-F instead) returns an empty
+    list rather than raising, so the caller can degrade to a "no 10-K
+    found" message. See .scratch/10k-reader/spec.md.
+    """
+    response = requests.get(
+        EDGAR_SUBMISSIONS_URL.format(cik=cik),
+        headers={"User-Agent": _SEC_USER_AGENT},
+        timeout=10,
+    )
+    response.raise_for_status()
+    recent = response.json()["filings"]["recent"]
+    filings = [
+        {
+            "accession_number": recent["accessionNumber"][i],
+            "primary_document": recent["primaryDocument"][i],
+            "filing_date": recent["filingDate"][i],
+            "report_date": recent["reportDate"][i],
+        }
+        for i, form in enumerate(recent["form"])
+        if form == "10-K"
+    ]
+    return filings[:5]
+
+
+EDGAR_ARCHIVES_BASE_URL = "https://www.sec.gov/Archives/edgar/data/{cik}/{accession}/"
+
+
+def _archives_base_url(cik: str, accession_number: str) -> str:
+    # The Archives path uses the CIK *without* leading zeros and the
+    # accession number with its dashes stripped -- unlike the
+    # submissions/companyfacts APIs, which use the zero-padded CIK. See
+    # .scratch/ticker-explorer/research/03-edgar-as-filed-statements-findings.md.
+    return EDGAR_ARCHIVES_BASE_URL.format(cik=int(cik), accession=accession_number.replace("-", ""))
+
+
+def _classify_statement_type(short_name: str) -> str | None:
+    """Classify a FilingSummary.xml report's ShortName into one of the
+    three core statements 10-K Reader's Exact-as-filed view supports, or
+    None if it's some other report in the same "Statements" bucket (e.g.
+    a Balance Sheet Parenthetical, or Statement of Shareholders' Equity).
+    Keyword-matched on the filer's own wording since ShortName casing and
+    phrasing (e.g. "Operations" vs "Income") varies by filer -- see
+    .scratch/ticker-explorer/research/03-edgar-as-filed-statements-findings.md.
+    """
+    text = short_name.upper()
+    if "PARENTHETICAL" in text:
+        return None
+    if "BALANCE SHEET" in text:
+        return "Balance Sheet"
+    if "CASH FLOW" in text:
+        return "Cash Flow Statement"
+    if "COMPREHENSIVE" in text:
+        return None
+    if "OPERATIONS" in text or "INCOME" in text:
+        return "Income Statement"
+    return None
+
+
+def map_filing_statements(cik: str, accession_number: str) -> dict[str, str]:
+    """Which R*.htm file is the Income Statement / Balance Sheet / Cash
+    Flow Statement for a given 10-K, discovered via that filing's own
+    FilingSummary.xml rather than hardcoded R-numbers -- these differ per
+    filer and even per filing year for the same filer. A filing with no
+    FilingSummary.xml at all (pre-XBRL, or the pre-2011 XML-report
+    format) returns an empty dict rather than raising; callers should
+    treat that as "exact-as-filed view isn't available for this filing."
+    See .scratch/10k-reader/spec.md.
+    """
+    response = requests.get(
+        _archives_base_url(cik, accession_number) + "FilingSummary.xml",
+        headers={"User-Agent": _SEC_USER_AGENT},
+        timeout=10,
+    )
+    if response.status_code == 404:
+        return {}
+    response.raise_for_status()
+
+    root = ElementTree.fromstring(response.content)
+    result: dict[str, str] = {}
+    for report in root.iter("Report"):
+        # Older FilingSummary.xml versions don't have MenuCategory at all
+        # -- only filter on it when present, and rely on ShortName
+        # keyword matching as the durable signal across filing eras.
+        menu_category = report.findtext("MenuCategory")
+        if menu_category is not None and menu_category != "Statements":
+            continue
+        html_file_name = report.findtext("HtmlFileName")
+        short_name = report.findtext("ShortName")
+        if not html_file_name or not short_name:
+            continue
+        statement_type = _classify_statement_type(short_name)
+        if statement_type and statement_type not in result:
+            result[statement_type] = html_file_name
+    return result
+
+
+def fetch_as_filed_statement(cik: str, accession_number: str, r_file: str) -> pd.DataFrame:
+    """The exact as-filed table for one statement of one filing -- the
+    filer's own row labels, order, and subtotals, parsed directly from
+    SEC's own rendered R*.htm, not re-labeled or remapped. See
+    .scratch/10k-reader/spec.md.
+    """
+    response = requests.get(
+        _archives_base_url(cik, accession_number) + r_file,
+        headers={"User-Agent": _SEC_USER_AGENT},
+        timeout=10,
+    )
+    response.raise_for_status()
+    return pd.read_html(io.StringIO(response.text))[0]
+
+
 def _fetch_companyfacts(cik: str) -> dict:
     response = requests.get(
         EDGAR_COMPANYFACTS_URL.format(cik=cik),
@@ -216,6 +335,19 @@ def _price_near(price_history: pd.DataFrame, target: pd.Timestamp, max_lookback_
     return float(window["AdjClose"].iloc[-1])
 
 
+def _resolve_revenue(facts: dict) -> dict[int, tuple[str, float]]:
+    # The bank tag is the highest-priority entry in a single per-period
+    # chain, not a whole-company either/or switch -- a filer with
+    # RevenuesNetOfInterestExpense for most years but a gap the standard
+    # chain happens to cover should still get that year filled in, per
+    # spec.md's "evaluated per fiscal period" rule.
+    bank_taxonomy, bank_tag = _BANK_REVENUE_TAG
+    return _fallback_per_period(
+        [_annual_facts(facts, bank_taxonomy, bank_tag)]
+        + [_annual_facts(facts, taxonomy, tag) for taxonomy, tag in _REVENUE_CHAIN]
+    )
+
+
 def get_fundamentals_history(cik: str, price_history: pd.DataFrame) -> pd.DataFrame:
     """Multi-year revenue, net income, EPS, dividends/share, and shares
     outstanding for `cik`, via SEC EDGAR's XBRL companyfacts API -- plus
@@ -226,17 +358,7 @@ def get_fundamentals_history(cik: str, price_history: pd.DataFrame) -> pd.DataFr
     load_company_tickers).
     """
     facts = _fetch_companyfacts(cik)
-
-    # The bank tag is the highest-priority entry in a single per-period
-    # chain, not a whole-company either/or switch -- a filer with
-    # RevenuesNetOfInterestExpense for most years but a gap the standard
-    # chain happens to cover should still get that year filled in, per
-    # spec.md's "evaluated per fiscal period" rule.
-    bank_taxonomy, bank_tag = _BANK_REVENUE_TAG
-    revenue = _fallback_per_period(
-        [_annual_facts(facts, bank_taxonomy, bank_tag)]
-        + [_annual_facts(facts, taxonomy, tag) for taxonomy, tag in _REVENUE_CHAIN]
-    )
+    revenue = _resolve_revenue(facts)
 
     net_income = _resolve_chain(facts, _NET_INCOME_CHAIN)
     eps = _resolve_chain(facts, _EPS_CHAIN)
@@ -298,6 +420,209 @@ def get_fundamentals_history(cik: str, price_history: pd.DataFrame) -> pd.DataFr
         return pd.DataFrame(columns=columns, index=pd.Index([], name="FiscalYear"))
 
     return pd.DataFrame(rows).set_index("FiscalYear")
+
+
+# Tag-fallback chains for 10-K Reader's Normalized sub-tab, decided in
+# .scratch/10k-reader/research/01-normalized-tag-mapping-findings.md
+# against live companyfacts data for AAPL, MSFT, JPM, and SPG. Revenue,
+# Net Income, EPS, Dividends/share, and Shares Outstanding reuse the
+# chains already defined above for get_fundamentals_history.
+_COST_OF_REVENUE_CHAIN = [
+    ("us-gaap", "CostOfGoodsAndServicesSold"),
+    ("us-gaap", "CostOfRevenue"),
+    ("us-gaap", "CostOfGoodsSold"),
+]
+_GROSS_PROFIT_CHAIN = [("us-gaap", "GrossProfit")]
+_OPERATING_EXPENSES_CHAIN = [("us-gaap", "OperatingExpenses"), ("us-gaap", "CostsAndExpenses")]
+# Banks don't tag OperatingExpenses/CostsAndExpenses at all -- same
+# per-period-priority pattern as _BANK_REVENUE_TAG, not a whole-company
+# either/or switch.
+_BANK_OPERATING_EXPENSES_TAG = ("us-gaap", "NoninterestExpense")
+_OPERATING_INCOME_CHAIN = [("us-gaap", "OperatingIncomeLoss")]
+_INTEREST_EXPENSE_CHAIN = [("us-gaap", "InterestExpense"), ("us-gaap", "InterestExpenseNonoperating")]
+_PRETAX_INCOME_CHAIN = [
+    ("us-gaap", "IncomeLossFromContinuingOperationsBeforeIncomeTaxesExtraordinaryItemsNoncontrollingInterest"),
+    ("us-gaap", "IncomeLossFromContinuingOperationsBeforeIncomeTaxesMinorityInterestAndIncomeLossFromEquityMethodInvestments"),
+]
+_INCOME_TAX_CHAIN = [("us-gaap", "IncomeTaxExpenseBenefit")]
+_EPS_BASIC_CHAIN = [("us-gaap", "EarningsPerShareBasic")]
+_EPS_DILUTED_CHAIN = [("us-gaap", "EarningsPerShareDiluted")]
+
+_CASH_CHAIN = [
+    ("us-gaap", "CashAndCashEquivalentsAtCarryingValue"),
+    ("us-gaap", "CashCashEquivalentsRestrictedCashAndRestrictedCashEquivalents"),
+]
+_CURRENT_ASSETS_CHAIN = [("us-gaap", "AssetsCurrent")]
+_PPE_CHAIN = [("us-gaap", "PropertyPlantAndEquipmentNet"), ("us-gaap", "RealEstateInvestmentPropertyNet")]
+_GOODWILL_TAG = ("us-gaap", "Goodwill")
+_INTANGIBLES_COMBINED_TAG = ("us-gaap", "IntangibleAssetsNetExcludingGoodwill")
+_INTANGIBLES_FINITE_TAG = ("us-gaap", "FiniteLivedIntangibleAssetsNet")
+_INTANGIBLES_INDEFINITE_TAG = ("us-gaap", "IndefiniteLivedIntangibleAssetsExcludingGoodwill")
+_TOTAL_ASSETS_CHAIN = [("us-gaap", "Assets")]
+_CURRENT_LIABILITIES_CHAIN = [("us-gaap", "LiabilitiesCurrent")]
+_LONG_TERM_DEBT_CHAIN = [
+    ("us-gaap", "LongTermDebtNoncurrent"),
+    ("us-gaap", "LongTermDebt"),
+    ("us-gaap", "LongTermDebtAndCapitalLeaseObligationsIncludingCurrentMaturities"),
+    ("us-gaap", "DebtAndCapitalLeaseObligations"),
+]
+_TOTAL_LIABILITIES_CHAIN = [("us-gaap", "Liabilities")]
+_STOCKHOLDERS_EQUITY_CHAIN = [
+    ("us-gaap", "StockholdersEquity"),
+    ("us-gaap", "StockholdersEquityIncludingPortionAttributableToNoncontrollingInterest"),
+]
+
+_OPERATING_CASH_FLOW_CHAIN = [("us-gaap", "NetCashProvidedByUsedInOperatingActivities")]
+_CAPEX_CHAIN = [("us-gaap", "PaymentsToAcquirePropertyPlantAndEquipment"), ("us-gaap", "PaymentsToAcquireProductiveAssets")]
+_INVESTING_CASH_FLOW_CHAIN = [("us-gaap", "NetCashProvidedByUsedInInvestingActivities")]
+_FINANCING_CASH_FLOW_CHAIN = [("us-gaap", "NetCashProvidedByUsedInFinancingActivities")]
+_NET_CHANGE_IN_CASH_CHAIN = [
+    ("us-gaap", "CashAndCashEquivalentsPeriodIncreaseDecrease"),
+    (
+        "us-gaap",
+        "CashCashEquivalentsRestrictedCashAndRestrictedCashEquivalentsPeriodIncreaseDecreaseIncludingExchangeRateEffect",
+    ),
+    (
+        "us-gaap",
+        "CashCashEquivalentsRestrictedCashAndRestrictedCashEquivalentsPeriodIncreaseDecreaseExcludingExchangeRateEffect",
+    ),
+]
+
+
+def _resolve_operating_expenses(facts: dict) -> dict[int, tuple[str, float]]:
+    bank_taxonomy, bank_tag = _BANK_OPERATING_EXPENSES_TAG
+    return _fallback_per_period(
+        [_annual_facts(facts, bank_taxonomy, bank_tag)]
+        + [_annual_facts(facts, taxonomy, tag) for taxonomy, tag in _OPERATING_EXPENSES_CHAIN]
+    )
+
+
+def _resolve_pretax_income(
+    facts: dict, net_income: dict[int, tuple[str, float]], income_tax: dict[int, tuple[str, float]]
+) -> dict[int, tuple[str, float]]:
+    pretax = _resolve_chain(facts, _PRETAX_INCOME_CHAIN)
+    # REITs (and any filer without a direct pre-tax subtotal tag) get an
+    # exact-identity derived fallback -- Net Income + Income Tax -- only
+    # for periods the direct chain didn't already resolve.
+    for fy in set(net_income) & set(income_tax):
+        if fy not in pretax:
+            net_end, net_val = net_income[fy]
+            _, tax_val = income_tax[fy]
+            pretax[fy] = (net_end, net_val + tax_val)
+    return pretax
+
+
+def _resolve_intangibles(facts: dict) -> dict[int, tuple[str, float]]:
+    combined = _annual_facts(facts, *_INTANGIBLES_COMBINED_TAG)
+    finite = _annual_facts(facts, *_INTANGIBLES_FINITE_TAG)
+    indefinite = _annual_facts(facts, *_INTANGIBLES_INDEFINITE_TAG)
+    # The combined tag, where present, already includes both finite- and
+    # indefinite-lived intangibles -- summing the component tags on top
+    # of it would double-count, so it wins outright for any period it
+    # covers.
+    result = dict(combined)
+    for fy in set(finite) | set(indefinite):
+        if fy in result:
+            continue
+        if fy in finite and fy in indefinite:
+            end, finite_val = finite[fy]
+            _, indef_val = indefinite[fy]
+            result[fy] = (end, finite_val + indef_val)
+        elif fy in finite:
+            result[fy] = finite[fy]
+        else:
+            result[fy] = indefinite[fy]
+    return result
+
+
+def _resolve_goodwill_and_intangibles(facts: dict) -> dict[int, tuple[str, float]]:
+    # No filer in the research sample reports a single combined
+    # "goodwill and intangibles" tag -- always a derived sum of two
+    # components.
+    goodwill = _annual_facts(facts, *_GOODWILL_TAG)
+    intangibles = _resolve_intangibles(facts)
+    result: dict[int, tuple[str, float]] = {}
+    for fy in set(goodwill) | set(intangibles):
+        g_end, g_val = goodwill.get(fy, (None, 0.0))
+        i_end, i_val = intangibles.get(fy, (None, 0.0))
+        end = g_end or i_end
+        assert end is not None  # fy is in goodwill's or intangibles' keys, so one of these is real
+        result[fy] = (end, g_val + i_val)
+    return result
+
+
+def _to_metric_by_year_frame(metrics: dict[str, dict[int, tuple[str, float]]], years: int | None) -> pd.DataFrame:
+    """Reshape {metric_label: {fiscal_year: (period_end, value)}} into one
+    DataFrame -- metric rows, fiscal-year columns, most-recent year first
+    -- matching how the Exact-as-filed tables and real 10-K statements
+    present, the opposite orientation from get_fundamentals_history's
+    fiscal-year-rows shape. `years=None` returns the company's full
+    available history; otherwise the most recent `years` columns. A
+    metric absent for a given year is simply missing from that column
+    (NaN), not zero -- the caller renders that as the dash placeholder.
+    """
+    all_fys = sorted({fy for series in metrics.values() for fy in series}, reverse=True)
+    selected_fys = all_fys if years is None else all_fys[:years]
+    df = pd.DataFrame(
+        {fy: {label: series[fy][1] for label, series in metrics.items() if fy in series} for fy in selected_fys}
+    )
+    df.index.name = "Metric"
+    return df
+
+
+def get_normalized_10k_financials(cik: str, years: int | None = 5) -> dict[str, pd.DataFrame]:
+    """Curated multi-year Income Statement / Balance Sheet / Cash Flow
+    tables for `cik` via SEC EDGAR's XBRL companyfacts API -- metric rows
+    x fiscal-year columns. `years` bounds how many of the most recent
+    fiscal years are included; pass None to reach the company's full
+    available EDGAR history. Kept separate from get_fundamentals_history
+    (not a modification of it) so that function's existing callers
+    (Historicals, Peer Analysis) can't regress. See
+    .scratch/10k-reader/spec.md and
+    .scratch/10k-reader/research/01-normalized-tag-mapping-findings.md.
+    """
+    facts = _fetch_companyfacts(cik)
+
+    net_income = _resolve_chain(facts, _NET_INCOME_CHAIN)
+    income_tax = _resolve_chain(facts, _INCOME_TAX_CHAIN)
+
+    income_statement = {
+        "Revenue": _resolve_revenue(facts),
+        "Cost of Revenue": _resolve_chain(facts, _COST_OF_REVENUE_CHAIN),
+        "Gross Profit": _resolve_chain(facts, _GROSS_PROFIT_CHAIN),
+        "Operating Expenses": _resolve_operating_expenses(facts),
+        "Operating Income": _resolve_chain(facts, _OPERATING_INCOME_CHAIN),
+        "Interest Expense": _resolve_chain(facts, _INTEREST_EXPENSE_CHAIN),
+        "Pre-tax Income": _resolve_pretax_income(facts, net_income, income_tax),
+        "Income Tax": income_tax,
+        "Net Income": net_income,
+        "EPS Basic": _resolve_chain(facts, _EPS_BASIC_CHAIN),
+        "EPS Diluted": _resolve_chain(facts, _EPS_DILUTED_CHAIN),
+    }
+    balance_sheet = {
+        "Cash & Equivalents": _resolve_chain(facts, _CASH_CHAIN),
+        "Total Current Assets": _resolve_chain(facts, _CURRENT_ASSETS_CHAIN),
+        "PP&E (net)": _resolve_chain(facts, _PPE_CHAIN),
+        "Goodwill & Intangible Assets": _resolve_goodwill_and_intangibles(facts),
+        "Total Assets": _resolve_chain(facts, _TOTAL_ASSETS_CHAIN),
+        "Total Current Liabilities": _resolve_chain(facts, _CURRENT_LIABILITIES_CHAIN),
+        "Long-term Debt": _resolve_chain(facts, _LONG_TERM_DEBT_CHAIN),
+        "Total Liabilities": _resolve_chain(facts, _TOTAL_LIABILITIES_CHAIN),
+        "Total Stockholders' Equity": _resolve_chain(facts, _STOCKHOLDERS_EQUITY_CHAIN),
+    }
+    cash_flow = {
+        "Operating Cash Flow": _resolve_chain(facts, _OPERATING_CASH_FLOW_CHAIN),
+        "Capital Expenditures": _resolve_chain(facts, _CAPEX_CHAIN),
+        "Investing Cash Flow": _resolve_chain(facts, _INVESTING_CASH_FLOW_CHAIN),
+        "Financing Cash Flow": _resolve_chain(facts, _FINANCING_CASH_FLOW_CHAIN),
+        "Net Change in Cash": _resolve_chain(facts, _NET_CHANGE_IN_CASH_CHAIN),
+    }
+
+    return {
+        "Income Statement": _to_metric_by_year_frame(income_statement, years),
+        "Balance Sheet": _to_metric_by_year_frame(balance_sheet, years),
+        "Cash Flow Statement": _to_metric_by_year_frame(cash_flow, years),
+    }
 
 
 _HISTORICALS_COLUMNS = ["Open", "High", "Low", "Close", "AdjClose", "Volume", "Dividends", "StockSplits"]

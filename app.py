@@ -32,10 +32,14 @@ from ticker_data import (
     get_fundamentals_from_finnhub,
     get_fundamentals_history,
     get_fundamentals_snapshot,
+    fetch_as_filed_statement,
     get_historicals,
     get_multi_ticker_historicals,
+    get_normalized_10k_financials,
+    list_10k_filings,
     load_company_tickers,
     load_sp500_constituents,
+    map_filing_statements,
     resolve_ticker,
 )
 
@@ -68,6 +72,15 @@ cached_get_fundamentals_from_alpha_vantage = st.cache_data(ttl=24 * 3600)(get_fu
 # source) change rarely -- same 24h TTL as the SEC ticker directory. See
 # .scratch/peer-analysis/spec.md.
 cached_load_sp500_constituents = st.cache_data(ttl=24 * 3600)(load_sp500_constituents)
+# A filer's 10-K history changes once a year at most -- same 24h TTL as
+# the other directory-style SEC lookups above. See .scratch/10k-reader/spec.md.
+cached_list_10k_filings = st.cache_data(ttl=24 * 3600)(list_10k_filings)
+# A given filing's own FilingSummary.xml/R.htm never change once filed --
+# cache indefinitely (well, 24h -- st.cache_data has no infinite option
+# here, but a specific past filing's contents are immutable).
+cached_map_filing_statements = st.cache_data(ttl=24 * 3600)(map_filing_statements)
+cached_fetch_as_filed_statement = st.cache_data(ttl=24 * 3600)(fetch_as_filed_statement)
+cached_get_normalized_10k_financials = st.cache_data(ttl=24 * 3600)(get_normalized_10k_financials)
 # get_multi_ticker_historicals and build_peer_fundamentals_pivot are
 # deliberately NOT wrapped in st.cache_data themselves -- both take a
 # cached function (e.g. cached_get_historicals) as an argument, and
@@ -1010,6 +1023,150 @@ def render_peer_analysis_tab(historicals_seed: tuple[str, str | None, pd.DataFra
         st.dataframe(pivot, width="stretch")
 
 
+# The three core 10-K statements, in display order -- shared by both the
+# Exact statement-type picker and the Normalized tab's table order, so
+# the two can't drift apart.
+STATEMENT_TYPES = ["Income Statement", "Balance Sheet", "Cash Flow Statement"]
+
+
+def _render_one_as_filed_table(cik: str, filing: dict, statement_type: str) -> None:
+    """Renders one filing's as-filed table for `statement_type`, plus its
+    own CSV download -- shared by the default single-filing view and the
+    5-year details expansion (ticket 03) so both go through the exact
+    same fetch/error/render path.
+    """
+    statements = fetch_or_none(
+        cached_map_filing_statements, cik, filing["accession_number"],
+        error_message="Couldn't reach SEC EDGAR for this filing's statements.",
+    )
+    if statements is None:
+        return
+
+    r_file = statements.get(statement_type)
+    if r_file is None:
+        st.markdown(
+            "<div class='te-note'>Exact-as-filed view isn't available for this filing "
+            "(it may predate SEC's XBRL tagging requirement).</div>",
+            unsafe_allow_html=True,
+        )
+        return
+
+    table = fetch_or_none(
+        cached_fetch_as_filed_statement, cik, filing["accession_number"], r_file,
+        error_message="Couldn't load this statement's as-filed table.",
+    )
+    if table is None:
+        return
+
+    st.markdown(
+        f"<div class='te-note'>As filed in the 10-K for fiscal year ended {filing['report_date']} "
+        f"(filed {filing['filing_date']}).</div>",
+        unsafe_allow_html=True,
+    )
+    st.dataframe(table, width="stretch", hide_index=True)
+    st.download_button(
+        "Download as-filed table (CSV)", table.to_csv(index=False).encode("utf-8"),
+        file_name=f"10k_exact_{statement_type.replace(' ', '_').lower()}_{filing['report_date']}.csv",
+        mime="text/csv", key=f"10k_exact_csv_{filing['accession_number']}",
+    )
+
+
+def render_10k_exact_tab(cik: str, filings: list[dict]) -> None:
+    statement_type = st.radio("Statement", STATEMENT_TYPES, key="10k_statement_type", horizontal=True)
+    show_details = st.checkbox(
+        f"Show all {len(filings)} available years" if len(filings) > 1 else "Show all available years",
+        key="10k_show_details",
+        help="Each year is shown as its own separate as-filed table, not merged into one -- "
+        "a company can reword or restructure line items between years.",
+    )
+
+    if not show_details:
+        _render_one_as_filed_table(cik, filings[0], statement_type)
+        return
+
+    # Each year renders independently -- _render_one_as_filed_table's own
+    # fetch_or_none calls catch that year's failure and show its own
+    # inline message, so one bad filing can't blank out the others in
+    # this loop.
+    for i, filing in enumerate(filings):
+        if i > 0:
+            st.markdown("<hr>", unsafe_allow_html=True)
+        _render_one_as_filed_table(cik, filing, statement_type)
+
+
+NORMALIZED_YEAR_RANGE_OPTIONS = ["5Y", "10Y", "ALL"]
+NORMALIZED_YEARS_BY_OPTION: dict[str, int | None] = {"5Y": 5, "10Y": 10, "ALL": None}
+# Per-share line items need 2-decimal formatting; everything else in
+# these tables is a whole-dollar figure -- applied as a Styler subset
+# override, not a per-metric formatter map, since it's the one exception.
+NORMALIZED_PER_SHARE_ROWS = ["EPS Basic", "EPS Diluted"]
+
+
+def render_10k_normalized_tab(cik: str) -> None:
+    year_range = st.segmented_control(
+        "Years", NORMALIZED_YEAR_RANGE_OPTIONS, default="5Y", required=True, key="10k_normalized_year_range",
+    )
+    years = NORMALIZED_YEARS_BY_OPTION[year_range]
+
+    financials = fetch_or_none(
+        cached_get_normalized_10k_financials, cik, years,
+        error_message="Couldn't reach SEC EDGAR for this company's financial history.",
+    )
+    if financials is None:
+        return
+
+    for statement_name in STATEMENT_TYPES:
+        st.markdown(f"<div class='te-group-title'>{statement_name}</div>", unsafe_allow_html=True)
+        table = financials[statement_name]
+        if table.empty:
+            st.markdown("<div class='te-note'>No data available.</div>", unsafe_allow_html=True)
+            continue
+
+        styled = table.style.format("{:,.0f}", na_rep="—")
+        per_share_rows = [row for row in NORMALIZED_PER_SHARE_ROWS if row in table.index]
+        if per_share_rows:
+            # A plain list here is ambiguous to Styler.format and gets
+            # read as column labels, not row labels -- pd.IndexSlice[rows, :]
+            # is the unambiguous "these rows, every column" form.
+            styled = styled.format("{:,.2f}", subset=pd.IndexSlice[per_share_rows, :], na_rep="—")  # type: ignore[arg-type]
+        st.dataframe(styled, width="stretch")
+
+        st.download_button(
+            f"Download {statement_name} (CSV)", table.to_csv().encode("utf-8"),
+            file_name=f"10k_normalized_{statement_name.replace(' ', '_').lower()}.csv",
+            mime="text/csv", key=f"10k_normalized_csv_{statement_name}",
+        )
+
+
+def render_10k_reader_tab(historicals_seed: tuple[str, str | None, pd.DataFrame] | None) -> None:
+    st.markdown("<div class='te-group-title'>10-K Reader</div>", unsafe_allow_html=True)
+
+    if historicals_seed is None:
+        st.markdown("<div class='te-note'>Search a ticker in Historicals to see its 10-K filings.</div>", unsafe_allow_html=True)
+        return
+
+    ticker, cik, _ = historicals_seed
+    if cik is None:
+        st.markdown(f"<div class='te-note'>No 10-K found for {ticker}.</div>", unsafe_allow_html=True)
+        return
+
+    filings = fetch_or_none(
+        cached_list_10k_filings, cik,
+        error_message="Couldn't reach SEC EDGAR's filing history. Try again shortly.",
+    )
+    if filings is None:
+        return
+    if not filings:
+        st.markdown(f"<div class='te-note'>No 10-K found for {ticker}.</div>", unsafe_allow_html=True)
+        return
+
+    tab_normalized, tab_exact = st.tabs(["Normalized", "Exact"])
+    with tab_normalized:
+        render_10k_normalized_tab(cik)
+    with tab_exact:
+        render_10k_exact_tab(cik, filings)
+
+
 def main() -> None:
     inject_theme()
 
@@ -1025,11 +1182,13 @@ def main() -> None:
             label_visibility="collapsed", placeholder="Ticker or company name — e.g. AAPL, or Apple",
         )
 
-    tab_historicals, tab_peer_analysis = st.tabs(["Historicals", "Peer Analysis"])
+    tab_historicals, tab_peer_analysis, tab_10k_reader = st.tabs(["Historicals", "Peer Analysis", "10-K Reader"])
     with tab_historicals:
         historicals_seed = render_historicals_tab(query)
     with tab_peer_analysis:
         render_peer_analysis_tab(historicals_seed)
+    with tab_10k_reader:
+        render_10k_reader_tab(historicals_seed)
 
 
 if __name__ == "__main__":
