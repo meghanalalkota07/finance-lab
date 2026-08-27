@@ -5,3 +5,7 @@ __pycache__/
 .mypy_cache/
 *.egg-info/
 .env
+
+CLAUDE.md
+CONTEXT.md
+.scratch/
