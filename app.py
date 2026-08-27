@@ -412,12 +412,18 @@ div[class*="st-key-ticker_search_bar"] {{
     background: var(--color-paper) !important;
 }}
 
-/* Selected segmented-control pill gets the confident accent fill --
-   after the standalone download button was removed (the dataframe's own
-   toolbar covers CSV export), this is the page's only accent-filled
-   control. */
+/* Selected segmented-control pill gets the confident accent fill. */
 [data-testid="stAppViewContainer"] button[aria-checked="true"] {{
     background: var(--color-accent) !important;
+    color: var(--color-accent-ink) !important;
+}}
+
+/* Multiselect tags (e.g. Peer Analysis's selected peers) are the other
+   accent-filled control -- same fill color, so they need the same dark
+   ink text as the segmented control above. Without this they inherit
+   the global light --color-ink text rule, which reads poorly against
+   the bright teal fill. */
+[data-testid="stMultiSelectTagsContainer"] span {{
     color: var(--color-accent-ink) !important;
 }}
 
