@@ -904,7 +904,7 @@ _PIVOT_METRICS: list[tuple[str, str]] = [
 _PIVOT_PLACEHOLDER = "—"
 
 
-def _format_money(value: float) -> str:
+def format_money(value: float) -> str:
     sign = "-" if value < 0 else ""
     magnitude = abs(value)
     if magnitude >= 1e12:
@@ -920,7 +920,7 @@ def _format_pivot_value(key: str, value):
     if key in ("sector", "industry"):
         return str(value)
     if key in ("market_cap", "revenue_fy", "net_income_fy"):
-        return _format_money(value)
+        return format_money(value)
     if key in ("trailing_pe", "forward_pe"):
         return f"{value:.1f}×"
     if key == "eps":

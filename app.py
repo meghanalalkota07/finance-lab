@@ -33,6 +33,7 @@ from ticker_data import (
     get_fundamentals_history,
     get_fundamentals_snapshot,
     fetch_as_filed_statement,
+    format_money,
     get_historicals,
     get_multi_ticker_historicals,
     get_normalized_10k_financials,
@@ -258,19 +259,23 @@ hr {{ border: none; margin: 1.6rem 0; }}
    content's own height, which gives a sticky descendant no "runway" to
    stick within (it un-sticks on the very first pixel of scroll). Fixed
    sidesteps that entirely; stMainBlockContainer's top padding is pushed
-   down below to leave room for it instead. Pinned just below Streamlit's
-   own 60px header (two elements pinned to the literal viewport top would
-   otherwise bleed into each other) -- an opaque fill + drop shadow (not a
-   hairline, per atmospheric's elevation-over-hairline rule) separates it
-   from the content scrolling underneath. */
+   down below to leave room for it instead. Pinned at the literal viewport
+   top (not below Streamlit's own header) -- that header is transparent
+   (see stHeader rule above), so leaving a gap for it just let scrolled
+   page content bleed through underneath; extending our own opaque fill
+   up to y=0 covers that seam. Streamlit's Deploy/menu controls render in
+   their own higher-stacked toolbar layer, so they stay clickable above
+   this. An opaque fill + drop shadow (not a hairline, per atmospheric's
+   elevation-over-hairline rule) separates it from the content scrolling
+   underneath. */
 div[class*="st-key-ticker_search_bar"] {{
     position: fixed;
-    top: 60px;
+    top: 0;
     left: 0;
     right: 0;
     z-index: 200;
     background: var(--color-paper);
-    padding: 0.9rem clamp(1rem, 5vw, 5rem) 1.1rem;
+    padding: calc(0.9rem + 60px) clamp(1rem, 5vw, 5rem) 1.1rem;
     box-shadow: 0 16px 28px -18px rgba(0, 0, 0, 0.7);
 }}
 [data-testid="stMainBlockContainer"] {{
@@ -1064,11 +1069,6 @@ def _render_one_as_filed_table(cik: str, filing: dict, statement_type: str) -> N
         unsafe_allow_html=True,
     )
     st.dataframe(table, width="stretch", hide_index=True)
-    st.download_button(
-        "Download as-filed table (CSV)", table.to_csv(index=False).encode("utf-8"),
-        file_name=f"10k_exact_{statement_type.replace(' ', '_').lower()}_{filing['report_date']}.csv",
-        mime="text/csv", key=f"10k_exact_csv_{filing['accession_number']}",
-    )
 
 
 def render_10k_exact_tab(cik: str, filings: list[dict]) -> None:
@@ -1122,24 +1122,25 @@ def render_10k_normalized_tab(cik: str) -> None:
             st.markdown("<div class='te-note'>No data available.</div>", unsafe_allow_html=True)
             continue
 
-        styled = table.style.format("{:,.0f}", na_rep="—")
+        # format_money abbreviates to $B/$T for on-screen readability;
+        # the Styler only changes display -- table itself (and the
+        # dataframe toolbar's own CSV export) still carries the exact
+        # underlying digits, per spec.md's "human readable on screen,
+        # exact in CSV" decision.
+        styled = table.style.format(format_money, na_rep="—")  # type: ignore[arg-type]
         per_share_rows = [row for row in NORMALIZED_PER_SHARE_ROWS if row in table.index]
         if per_share_rows:
             # A plain list here is ambiguous to Styler.format and gets
             # read as column labels, not row labels -- pd.IndexSlice[rows, :]
             # is the unambiguous "these rows, every column" form.
-            styled = styled.format("{:,.2f}", subset=pd.IndexSlice[per_share_rows, :], na_rep="—")  # type: ignore[arg-type]
+            styled = styled.format(
+                lambda v: f"${v:,.2f}", subset=pd.IndexSlice[per_share_rows, :], na_rep="—"  # type: ignore[arg-type]
+            )
         st.dataframe(styled, width="stretch")
-
-        st.download_button(
-            f"Download {statement_name} (CSV)", table.to_csv().encode("utf-8"),
-            file_name=f"10k_normalized_{statement_name.replace(' ', '_').lower()}.csv",
-            mime="text/csv", key=f"10k_normalized_csv_{statement_name}",
-        )
 
 
 def render_10k_reader_tab(historicals_seed: tuple[str, str | None, pd.DataFrame] | None) -> None:
-    st.markdown("<div class='te-group-title'>10-K Reader</div>", unsafe_allow_html=True)
+    st.markdown("<div class='te-group-title'>Financial Statements</div>", unsafe_allow_html=True)
 
     if historicals_seed is None:
         st.markdown("<div class='te-note'>Search a ticker in Historicals to see its 10-K filings.</div>", unsafe_allow_html=True)
@@ -1182,7 +1183,7 @@ def main() -> None:
             label_visibility="collapsed", placeholder="Ticker or company name — e.g. AAPL, or Apple",
         )
 
-    tab_historicals, tab_peer_analysis, tab_10k_reader = st.tabs(["Historicals", "Peer Analysis", "10-K Reader"])
+    tab_historicals, tab_peer_analysis, tab_10k_reader = st.tabs(["Historicals", "Peer Analysis", "Financial Statements"])
     with tab_historicals:
         historicals_seed = render_historicals_tab(query)
     with tab_peer_analysis:
