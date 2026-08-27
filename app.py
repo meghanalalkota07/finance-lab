@@ -234,6 +234,15 @@ THEME_CSS = f"""
     color: var(--color-ink);
     font-family: 'Geist', -apple-system, sans-serif;
 }}
+/* The rule above's font-family also caught stIconMaterial spans
+   (expander chevrons, etc.), which render via a ligature font --
+   "keyboard_arrow_down" showed up as literal text instead of the arrow
+   glyph once Geist replaced Streamlit's own icon font. Restore it
+   (self-hosted by Streamlit, confirmed via its own @font-face rule --
+   not a Google Fonts dependency). */
+[data-testid="stIconMaterial"] {{
+    font-family: 'Material Symbols Rounded' !important;
+}}
 [data-testid="stAppViewContainer"] h1,
 [data-testid="stAppViewContainer"] h2,
 [data-testid="stAppViewContainer"] h3 {{
