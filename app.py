@@ -895,19 +895,27 @@ def render_peer_analysis_tab(historicals_seed: tuple[str, str | None, pd.DataFra
 
     sectors = sorted({c["sector"] for c in constituents})
 
-    # Pre-seed from the Historicals tab's searched ticker, but only on this
-    # tab's very first render this session -- afterwards the user's own
-    # sector/sub-industry/peer picks take over. See spec.md's Ticket 06.
+    # Re-seed from the Historicals tab's searched ticker whenever that
+    # ticker actually changes (not just once per session) -- comparing
+    # against the last-seeded ticker, not a one-shot flag, so searching a
+    # new stock re-syncs Sector/Sub-Industry/peers each time, while the
+    # user's own picks are left alone on reruns where the ticker hasn't
+    # changed (widget interactions, tab switches, etc).
+    current_ticker = historicals_seed[0] if historicals_seed is not None else None
+    should_reseed = current_ticker != st.session_state.get("peer_last_seeded_ticker")
     seed_match = None
-    if not st.session_state.get("peer_analysis_seeded", False):
-        st.session_state["peer_analysis_seeded"] = True
-        if historicals_seed is not None:
-            seed_match = next((c for c in constituents if c["ticker"] == historicals_seed[0]), None)
+    if should_reseed:
+        st.session_state["peer_last_seeded_ticker"] = current_ticker
+        if current_ticker is not None:
+            seed_match = next((c for c in constituents if c["ticker"] == current_ticker), None)
 
     default_sector = seed_match["sector"] if seed_match else PEER_DEFAULT_SECTOR
     if default_sector not in sectors:
         default_sector = sectors[0]
-    st.session_state.setdefault("peer_sector", default_sector)
+    if should_reseed:
+        st.session_state["peer_sector"] = default_sector
+    else:
+        st.session_state.setdefault("peer_sector", default_sector)
 
     c1, c2 = st.columns(2)
     with c1:
@@ -917,7 +925,10 @@ def render_peer_analysis_tab(historicals_seed: tuple[str, str | None, pd.DataFra
     sub_industries = ["All"] + sorted({c["sub_industry"] for c in sector_constituents})
 
     default_sub_industry = seed_match["sub_industry"] if (seed_match and seed_match["sector"] == sector) else "All"
-    st.session_state.setdefault("peer_sub_industry", default_sub_industry)
+    if should_reseed:
+        st.session_state["peer_sub_industry"] = default_sub_industry
+    else:
+        st.session_state.setdefault("peer_sub_industry", default_sub_industry)
     if st.session_state["peer_sub_industry"] not in sub_industries:
         # A sub-industry left over from a previously-selected sector that
         # doesn't exist in this one -- fall back rather than let the
@@ -1037,7 +1048,10 @@ def render_peer_analysis_tab(historicals_seed: tuple[str, str | None, pd.DataFra
         error_message="Peer fundamentals are temporarily unavailable.",
     )
     if pivot is not None:
-        st.dataframe(pivot, width="stretch")
+        # Explicit height sized to the row count -- st.dataframe's default
+        # height caps well short of this table's typical row count (one
+        # row per Fundamentals metric), forcing an internal scrollbar.
+        st.dataframe(pivot, width="stretch", height=(len(pivot) + 1) * 35 + 3)
 
 
 # The three core 10-K statements, in display order -- shared by both the
