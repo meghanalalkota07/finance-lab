@@ -225,7 +225,7 @@ THEME_CSS = f"""
         var(--color-paper);
     background-attachment: fixed;
 }}
-[data-testid="stHeader"] {{ background-color: transparent; }}
+[data-testid="stHeader"] {{ display: none; }}
 [data-testid="stAppViewContainer"] p,
 [data-testid="stAppViewContainer"] span,
 [data-testid="stAppViewContainer"] label,
@@ -260,14 +260,11 @@ hr {{ border: none; margin: 1.6rem 0; }}
    stick within (it un-sticks on the very first pixel of scroll). Fixed
    sidesteps that entirely; stMainBlockContainer's top padding is pushed
    down below to leave room for it instead. Pinned at the literal viewport
-   top (not below Streamlit's own header) -- that header is transparent
-   (see stHeader rule above), so leaving a gap for it just let scrolled
-   page content bleed through underneath; extending our own opaque fill
-   up to y=0 covers that seam. Streamlit's Deploy/menu controls render in
-   their own higher-stacked toolbar layer, so they stay clickable above
-   this. An opaque fill + drop shadow (not a hairline, per atmospheric's
-   elevation-over-hairline rule) separates it from the content scrolling
-   underneath. */
+   top -- Streamlit's own header is hidden entirely (see stHeader rule
+   above), so there's nothing above this bar to leave room for or bleed
+   through underneath it. An opaque fill + drop shadow (not a hairline,
+   per atmospheric's elevation-over-hairline rule) separates it from the
+   content scrolling underneath. */
 div[class*="st-key-ticker_search_bar"] {{
     position: fixed;
     top: 0;
@@ -275,7 +272,7 @@ div[class*="st-key-ticker_search_bar"] {{
     right: 0;
     z-index: 200;
     background: var(--color-paper);
-    padding: calc(0.9rem + 60px) clamp(1rem, 5vw, 5rem) 1.1rem;
+    padding: 0.9rem clamp(1rem, 5vw, 5rem) 1.1rem;
     box-shadow: 0 16px 28px -18px rgba(0, 0, 0, 0.7);
 }}
 [data-testid="stMainBlockContainer"] {{
