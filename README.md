@@ -30,7 +30,7 @@ Every data table has CSV export via its own toolbar.
 Requires Python 3.11+.
 
 ```bash
-pip install -e ".[dev]"
+pip install -r requirements-dev.txt   # or requirements.txt to just run the app
 ```
 
 Two Fundamentals cross-check sources (Finnhub, Alpha Vantage) need free API

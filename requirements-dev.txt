@@ -1,0 +1,6 @@
+-r requirements.txt
+pytest>=8.0
+requests-mock>=1.12
+mypy>=1.10
+pandas-stubs
+types-requests
