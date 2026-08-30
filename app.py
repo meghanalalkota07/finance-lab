@@ -22,6 +22,7 @@ import pandas as pd
 import plotly.graph_objects as go
 import streamlit as st
 from dotenv import load_dotenv
+from yfinance.exceptions import YFRateLimitError
 
 from ticker_data import (
     build_fundamentals_pivot,
@@ -547,9 +548,24 @@ def fetch_or_none(fn: Callable[..., T], *args, error_message: str, show=st.error
     external call in this app goes through here so a transient yfinance/
     EDGAR outage degrades to a visible message, per spec.md's "plain
     error state, no fallback" decision.
+
+    Yahoo Finance rate-limiting (yfinance's own YFRateLimitError) is
+    caught before the generic case and given its own message -- shared
+    hosting (e.g. Streamlit Community Cloud) shares an IP pool with many
+    other yfinance-using apps and hits this often. Without this, a
+    rate-limited call looked identical to "no such ticker" to the user,
+    which is actively misleading (the ticker is fine; retrying shortly
+    usually works).
     """
     try:
         return fn(*args, **kwargs)
+    except YFRateLimitError:
+        logger.exception("%s rate-limited by Yahoo Finance", getattr(fn, "__name__", repr(fn)))
+        show(
+            "Yahoo Finance is temporarily rate-limiting requests from this app "
+            "(common on shared hosting like Streamlit Community Cloud) -- try again in a minute or two."
+        )
+        return None
     except Exception:
         logger.exception("%s failed", getattr(fn, "__name__", repr(fn)))
         show(error_message)
