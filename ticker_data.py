@@ -13,9 +13,11 @@ import io
 import logging
 import os
 import re
+from collections import Counter
 from datetime import date
 from xml.etree import ElementTree
 
+import lxml.html
 import pandas as pd
 import requests
 import yfinance as yf
@@ -238,11 +240,80 @@ def map_filing_statements(cik: str, accession_number: str) -> dict[str, str]:
     return result
 
 
+# SEC's R.htm rendering (itself generated from the filing's own XBRL data)
+# puts each row's underlying XBRL concept in a javascript handler on the
+# label cell's <a> tag, e.g. onclick="top.Show.showAR(this,
+# 'defref_us-gaap_Revenues', window)" -- a stable convention across all
+# EDGAR XBRL filers' R.htm output, confirmed present on value rows and
+# abstract/header rows alike. This is what makes rows identifiable beyond
+# their display text: two rows can render the identical label ("Subscription"
+# under both Revenue and Cost of Revenue is a real example) while tagging
+# different concepts -- see .scratch/10k-exact-concept-ids/spec.md.
+_CONCEPT_REF_RE = re.compile(r"showAR\(\s*this\s*,\s*'(defref_[^']+)'")
+
+
+def _cell_text(cell) -> str:
+    return cell.text_content().replace("\xa0", " ").strip()
+
+
+def _row_concept(label_cell) -> str | None:
+    for anchor in label_cell.iter("a"):
+        onclick = anchor.get("onclick") or ""
+        match = _CONCEPT_REF_RE.search(onclick)
+        if match:
+            return match.group(1)
+    return None
+
+
+def _disambiguate_repeated_concepts(concepts: list[str], labels: list[str]) -> list[str]:
+    """A single instant-in-time XBRL concept (e.g. a cash balance) is
+    routinely reported twice on the same Cash Flow Statement -- once as
+    the period's beginning balance, once as its ending balance -- since
+    XBRL has no separate concept for "beginning" vs "ending", only a
+    different context (period) for the same tag, which isn't visible
+    from the R.htm markup this parser reads. Confirmed on Apple's actual
+    10-K Cash Flow Statement, and the same shape as the dimensional-axis
+    collision this parser already resolves, just without an axis marker
+    to key off of.
+
+    Any concept appearing more than once within this one table's own
+    rows gets its differing label folded into the key (labels do differ
+    in every real case observed: "beginning balances" vs "ending
+    balances"); if even that still collides, an occurrence count is
+    appended so two rows within one table can never end up sharing a
+    key. A concept appearing exactly once is left untouched, so the
+    common case keeps matching across filings by concept alone (a filer
+    rewording a label between years shouldn't stop it matching).
+    """
+    concept_counts = Counter(concepts)
+    occurrence_counts: dict[tuple[str, str], int] = {}
+    disambiguated: list[str] = []
+    for concept, label in zip(concepts, labels):
+        if concept_counts[concept] == 1:
+            disambiguated.append(concept)
+            continue
+        occurrence = occurrence_counts.get((concept, label), 0)
+        occurrence_counts[(concept, label)] = occurrence + 1
+        suffix = label if occurrence == 0 else f"{label}#{occurrence + 1}"
+        disambiguated.append(f"{concept}::{suffix}")
+    return disambiguated
+
+
 def fetch_as_filed_statement(cik: str, accession_number: str, r_file: str) -> pd.DataFrame:
     """The exact as-filed table for one statement of one filing -- the
     filer's own row labels, order, and subtotals, parsed directly from
     SEC's own rendered R*.htm, not re-labeled or remapped. See
     .scratch/10k-reader/spec.md.
+
+    Parses the raw HTML directly (rather than pandas.read_html, which
+    only sees display text) so each row's XBRL concept identifier can be
+    captured as that row's true identity -- returned as the DataFrame's
+    row index. A row with no parseable concept reference (rare) falls
+    back to a synthetic, position-based key that can't collide with a
+    real concept, so it's never dropped. Callers that need to merge rows
+    across filings should match on this index, not on the label column
+    -- see merge_as_filed_statements and
+    .scratch/10k-exact-concept-ids/spec.md.
     """
     response = requests.get(
         _archives_base_url(cik, accession_number) + r_file,
@@ -250,7 +321,139 @@ def fetch_as_filed_statement(cik: str, accession_number: str, r_file: str) -> pd
         timeout=10,
     )
     response.raise_for_status()
-    return pd.read_html(io.StringIO(response.text))[0]
+    return _parse_as_filed_statement_html(response.text)
+
+
+def _parse_as_filed_statement_html(html: str) -> pd.DataFrame:
+    root = lxml.html.fromstring(html)
+    tables = root.xpath('//table[contains(@class, "report")]') or root.xpath("//table")
+    if not tables:
+        raise ValueError("No statement table found in as-filed HTML")
+    table_el = tables[0]
+
+    all_rows = table_el.xpath(".//tr")
+    header_rows = [row for row in all_rows if row.xpath("./th") and not row.xpath("./td")]
+    body_rows = [row for row in all_rows if row.xpath("./td")]
+
+    if len(header_rows) >= 2:
+        title = _cell_text(header_rows[0].xpath("./th")[0])
+        periods = [_cell_text(th) for th in header_rows[-1].xpath("./th")]
+    else:
+        header_cells = header_rows[0].xpath("./th") if header_rows else []
+        title = _cell_text(header_cells[0]) if header_cells else ""
+        periods = [_cell_text(th) for th in header_cells[1:]]
+
+    concepts: list[str] = []
+    labels: list[str] = []
+    value_rows: list[list[object]] = []
+    # Some filers append a "broken down by X" disaggregation directly
+    # inside the same statement table (e.g. Adobe's Income Statement
+    # R.htm reports Subscription/Product/Services-and-other revenue this
+    # way) -- SEC renders the start of each group as its own row whose
+    # concept reference has the shape `defref_<Axis>=<Member>` rather
+    # than a plain concept, confirmed on Adobe's actual FY2025 10-K. Rows
+    # under that group reuse the *same* base concepts as the top-level
+    # statement (e.g. "Revenue" tagged us-gaap:Revenues appears once per
+    # group, not just once overall) -- without folding the active group
+    # into their key, those repeats collide across groups exactly the
+    # same way same-labeled-different-concept rows did, and the last
+    # group processed silently wins. See .scratch/10k-exact-concept-ids
+    # for the investigation that found this.
+    current_axis_context: str | None = None
+    for i, row in enumerate(body_rows):
+        cells = row.xpath("./td")
+        label_cell = cells[0]
+        label = _cell_text(label_cell)
+        raw_concept = _row_concept(label_cell)
+
+        if raw_concept is not None and "=" in raw_concept:
+            current_axis_context = raw_concept
+            concept = raw_concept
+        else:
+            base_concept = raw_concept or f"__unlabeled_row_{i}__{label}"
+            concept = f"{current_axis_context}::{base_concept}" if current_axis_context else base_concept
+
+        concepts.append(concept)
+        labels.append(label)
+
+        raw_values = [_cell_text(cell) for cell in cells[1:]]
+        row_values: list[object] = []
+        for j in range(len(periods)):
+            value = raw_values[j] if j < len(raw_values) else ""
+            row_values.append(float("nan") if value == "" else value)
+        value_rows.append(row_values)
+
+    concepts = _disambiguate_repeated_concepts(concepts, labels)
+
+    df = pd.DataFrame(value_rows, columns=periods)
+    df.insert(0, title, labels)
+    df.index = pd.Index(concepts, name="concept")
+    return df
+
+
+def merge_as_filed_statements(tables: list[pd.DataFrame], year_labels: list[str]) -> pd.DataFrame:
+    """Merge multiple as-filed statement tables (one per filing, see
+    fetch_as_filed_statement) into a single wide table: one column per
+    `year_labels` entry (same order/length as `tables`), one row per
+    unique XBRL concept across all of them. Only each filing's own
+    primary column (`table.columns[1]`, its most-recently-reported
+    period) is used -- a filing's own table already repeats 1-2 prior
+    years for comparison, and including those would duplicate the same
+    figures across overlapping filings, which is what produced the
+    confusing overlapping-year display this replaces (5 separate tables,
+    each with its own 2-year span, reading like "12 23 34 45" down the
+    page instead of 5 distinct years).
+
+    Rows are matched by each table's row index (the XBRL concept
+    identifier fetch_as_filed_statement now returns), not by display
+    label text -- two rows can render the identical label while tagging
+    different concepts (e.g. a company reporting "Subscription" under
+    both Revenue and Cost of Revenue), and matching on label text alone
+    let the later one silently overwrite the earlier one's value. The
+    label shown for a merged row is taken from whichever filing was
+    processed first (see row-order note below) -- a filer rewording a
+    line's label between years no longer risks a value collision, at
+    most an older year's value appears under newer wording. A genuine
+    XBRL tag migration for what reads as "the same" line (e.g. adopting
+    a new revenue-recognition tag) is intentionally left as two separate
+    rows rather than heuristically re-merged: a visible split of
+    still-correct data beats a silent, possibly-wrong merge. See
+    .scratch/10k-exact-concept-ids/spec.md.
+
+    A concept missing from a given filing gets "" (blank), not NaN or 0
+    -- these are as-filed figures, not computed ones, so there's no
+    meaningful zero to fill in. Row order follows first-seen order
+    scanning `tables` in the order given (callers pass most-recent-
+    filing-first), so a concept unique to an older filing still gets a
+    place, appended after the newer filings' own row order.
+    """
+    if not tables:
+        return pd.DataFrame()
+
+    labels_by_concept: dict[str, str] = {}
+    values_by_concept: dict[str, dict[str, object]] = {}
+    concept_order: list[str] = []
+    for table, year_label in zip(tables, year_labels):
+        if table.shape[1] < 2:
+            continue
+        label_col, value_col = table.columns[0], table.columns[1]
+        for raw_concept, entry in table.iterrows():
+            concept = str(raw_concept)
+            if concept not in labels_by_concept:
+                labels_by_concept[concept] = str(entry[label_col])
+                concept_order.append(concept)
+            value = entry[value_col]
+            values_by_concept.setdefault(concept, {})[year_label] = "" if pd.isna(value) else value
+
+    merged = pd.DataFrame(
+        {
+            year_label: [values_by_concept.get(concept, {}).get(year_label, "") for concept in concept_order]
+            for year_label in year_labels
+        }
+    )
+    merged.index = pd.Index([labels_by_concept[concept] for concept in concept_order])
+    merged.index.name = str(tables[0].columns[0])
+    return merged
 
 
 def _fetch_companyfacts(cik: str) -> dict:
