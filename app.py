@@ -15,8 +15,9 @@ THEME_CSS below for the specific choices and why.
 from __future__ import annotations
 
 import logging
+from contextlib import contextmanager
 from datetime import date, timedelta
-from typing import Callable, TypeVar
+from typing import Callable, Iterator, TypeVar
 
 import pandas as pd
 import plotly.graph_objects as go
@@ -1078,6 +1079,34 @@ def render_peer_analysis_tab(historicals_seed: tuple[str, str | None, pd.DataFra
         st.dataframe(pivot, width="stretch", height=(len(pivot) + 1) * 35 + 3)
 
 
+@contextmanager
+def _stale_content_barrier(key: str, ticker: str, loading_message: str) -> Iterator[None]:
+    """Wraps a block of slow-fetch-backed content (financial statement
+    tables and their download buttons) in a leaf-level st.empty() so a
+    ticker switch tears down the *previous* ticker's stale, still-live
+    widgets immediately -- before the slow fetch even starts -- instead
+    of leaving them clickable for the whole fetch duration. See
+    render_10k_normalized_tab's own comment for the full explanation and
+    tests/e2e/test_download_ticker_consistency.py for the regression this
+    guards against.
+
+    `key` scopes the "have we already rendered this ticker here" check
+    to one call site (different call sites need their own key). The
+    session-state update always runs, even if the wrapped block returns
+    early or raises, so a fetch failure doesn't leave the barrier
+    permanently re-triggering "Loading" on every subsequent rerun.
+    """
+    slot = st.empty()
+    if ticker != st.session_state.get(key):
+        with slot.container():
+            st.markdown(f"<div class='te-note'>{loading_message}</div>", unsafe_allow_html=True)
+    try:
+        with slot.container():
+            yield
+    finally:
+        st.session_state[key] = ticker
+
+
 # The three core 10-K statements, in display order -- shared by both the
 # Exact statement-type picker and the Normalized tab's table order, so
 # the two can't drift apart.
@@ -1197,24 +1226,17 @@ def render_10k_exact_tab(ticker: str, cik: str, filings: list[dict]) -> None:
         "year -- blank where a filing didn't report that line item.",
     )
 
-    # Same stale-download-button race as render_10k_normalized_tab (see
-    # its comment) -- these tables' CSV buttons sit behind their own slow
-    # SEC EDGAR fetches, so they need their own leaf-level st.empty()
-    # loading barrier too, keyed separately since a user can be on a
-    # different statement_type/show_details combination than Normalized.
-    slot = st.empty()
+    # These tables' CSV buttons sit behind their own slow SEC EDGAR
+    # fetches, so they need the same stale-download-button barrier as
+    # Normalized (see _stale_content_barrier) -- keyed separately since a
+    # user can be on a different statement_type/show_details combination
+    # than Normalized.
     cache_key = f"_10k_exact_last_rendered_{statement_type}_{show_details}"
-    if ticker != st.session_state.get(cache_key):
-        with slot.container():
-            st.markdown(f"<div class='te-note'>Loading {ticker}'s filings…</div>", unsafe_allow_html=True)
-
-    with slot.container():
+    with _stale_content_barrier(cache_key, ticker, f"Loading {ticker}'s filings…"):
         if not show_details:
             _render_one_as_filed_table(ticker, cik, filings[0], statement_type)
         else:
             _render_merged_as_filed_table(ticker, cik, filings, statement_type)
-
-    st.session_state[cache_key] = ticker
 
 
 NORMALIZED_YEAR_RANGE_OPTIONS = ["5Y", "10Y", "ALL"]
@@ -1236,18 +1258,15 @@ def render_10k_normalized_tab(ticker: str, cik: str) -> None:
     # replaces a widget's DOM node -- a download button's embedded bytes
     # included -- once script execution reaches its position in a new
     # rerun; until then, the *previous* ticker's button here stays fully
-    # live and clickable. A dedicated st.empty() at a *leaf* position
-    # (not wrapping st.tabs itself, which has its own persistence
+    # live and clickable. _stale_content_barrier (a leaf-level st.empty(),
+    # not wrapping st.tabs itself, which has its own persistence
     # semantics for keeping the inactive tab's content around) reliably
     # tears down that stale content the instant the ticker changes,
     # before the slow fetch even starts -- confirmed via
     # tests/e2e/test_download_ticker_consistency.py.
-    slot = st.empty()
-    if ticker != st.session_state.get("_10k_normalized_last_rendered_ticker"):
-        with slot.container():
-            st.markdown(f"<div class='te-note'>Loading {ticker}'s financials…</div>", unsafe_allow_html=True)
-
-    with slot.container():
+    with _stale_content_barrier(
+        "_10k_normalized_last_rendered_ticker", ticker, f"Loading {ticker}'s financials…"
+    ):
         financials = fetch_or_none(
             cached_get_normalized_10k_financials, cik, years,
             error_message="Couldn't reach SEC EDGAR for this company's financial history.",
@@ -1285,8 +1304,6 @@ def render_10k_normalized_tab(ticker: str, cik: str) -> None:
                 mime="text/csv", key=f"10k_normalized_dl_{statement_name}",
             )
 
-    st.session_state["_10k_normalized_last_rendered_ticker"] = ticker
-
 
 def render_10k_reader_tab(historicals_seed: tuple[str, str | None, pd.DataFrame] | None) -> None:
     st.markdown("<div class='te-group-title'>Financial Statements</div>", unsafe_allow_html=True)
@@ -1315,8 +1332,6 @@ def render_10k_reader_tab(historicals_seed: tuple[str, str | None, pd.DataFrame]
         render_10k_normalized_tab(ticker, cik)
     with tab_exact:
         render_10k_exact_tab(ticker, cik, filings)
-
-    st.session_state["_10k_last_rendered_ticker"] = ticker
 
 
 def main() -> None:

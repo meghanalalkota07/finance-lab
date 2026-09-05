@@ -51,14 +51,33 @@ streamlit run app.py
 ## Testing
 
 ```bash
-pytest
+pytest          # fast, offline unit suite (default -- excludes the e2e-marked tests below)
 mypy .
 ```
 
+A slower, network-dependent `e2e`-marked set is excluded by default (see
+`pytest.ini`'s `-m "not e2e"`) and run explicitly:
+
+```bash
+pytest -m e2e
+```
+
+This covers two kinds of check the fast suite can't: `tests/e2e/` drives a
+real browser against a locally-running instance of the app (needs
+Chromium via Playwright) to catch UI-timing issues that don't exist when
+calling a function directly; other `test_*` files marked `e2e` (alongside
+their fast, offline siblings) hit live SEC EDGAR / yfinance to validate
+data-layer parsing against real, current filings rather than fixtures
+alone.
+
 ## Project structure
 
-- `app.py` — Streamlit UI, layout, and caching. Not unit-tested directly.
+- `app.py` — Streamlit UI, layout, and caching. Not unit-tested directly,
+  except for a handful of browser-driven `e2e` tests under `tests/e2e/`
+  that check UI-timing behavior a direct function call can't exercise.
 - `ticker_data.py` — the data-service layer: every external fetch (yfinance,
   SEC EDGAR, Finnhub, Alpha Vantage, S&P 500 constituents) as a pure,
-  Streamlit-free function, unit-tested via `requests-mock`.
-- `tests/` — the test suite for `ticker_data.py`.
+  Streamlit-free function, unit-tested via `requests-mock`; a few `e2e`-marked
+  tests also validate it live against real SEC EDGAR data.
+- `tests/` — the test suite: fast, offline unit tests by default, plus the
+  `e2e`-marked tests described above.

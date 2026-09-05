@@ -49,17 +49,18 @@ def _top_20_sp500_by_market_cap() -> list[dict]:
     return [constituent for market_cap, constituent in ranked[:20] if market_cap > 0]
 
 
-def _count_body_rows_with_concept_reference(html: str) -> tuple[int, int]:
-    """Independent (re-derived, not reusing ticker_data's own internals)
-    count of statement rows in the raw HTML and how many of them carry a
-    parseable XBRL concept reference -- used to confirm
-    fetch_as_filed_statement never silently drops or collapses a row.
+def _count_source_body_rows(html: str) -> int:
+    """Counts statement rows directly in the raw HTML (re-parsed here,
+    not reading fetch_as_filed_statement's own output) -- used to confirm
+    the parser never silently drops or collapses a row. Deliberately the
+    stricter of the two counts ticket 03 describes (all body rows, not
+    just ones carrying a concept reference): every row gets a key in the
+    output either way -- a real concept reference or a synthetic
+    fallback -- so this bound never has false negatives.
     """
     root = lxml.html.fromstring(html)
     tables = root.xpath('//table[contains(@class, "report")]') or root.xpath("//table")
-    body_rows = [row for row in tables[0].xpath(".//tr") if row.xpath("./td")]
-    with_concept = sum(1 for row in body_rows if td._row_concept(row.xpath("./td")[0]) is not None)
-    return len(body_rows), with_concept
+    return len([row for row in tables[0].xpath(".//tr") if row.xpath("./td")])
 
 
 def _latest_10k_statement_r_files(ticker: str, cik: str) -> dict[str, tuple[str, str]]:
@@ -112,7 +113,7 @@ def _validate_one_company(ticker: str, cik: str) -> tuple[list[str], str | None]
             headers={"User-Agent": td._SEC_USER_AGENT},
             timeout=10,
         ).text
-        source_row_count, _ = _count_body_rows_with_concept_reference(html)
+        source_row_count = _count_source_body_rows(html)
         if len(df) != source_row_count:
             failures.append(
                 f"{ticker} {statement_type}: parsed {len(df)} rows but source HTML has {source_row_count} "
@@ -179,3 +180,74 @@ def test_adobe_revenue_breakdown_resolves_correctly_live():
         f"breakdown groups {groups} don't sum to the top-level total {total} -- "
         "a group may still be colliding with another"
     )
+
+
+def test_adobe_merged_5_year_view_shows_correct_historical_breakdown_live():
+    """Ticket 02's specific acceptance criterion: "viewing Adobe's merged
+    5-year Income Statement: Subscription and Product show Adobe's actual
+    reported revenue for FY2021-FY2022 ... and blank cells for
+    FY2023-FY2025 ... confirmed by fetching Adobe's real filings, not a
+    synthetic fixture alone." This exercises merge_as_filed_statements
+    itself (not just the single-filing fetch, which the test above
+    already covers live) against Adobe's five most recent real 10-Ks.
+    """
+    tickers = td.load_company_tickers()
+    cik = td.resolve_ticker(KNOWN_REGRESSION_TICKER, tickers)[0]["cik"]
+    filings = td.list_10k_filings(cik)
+    assert len(filings) >= 5, f"expected at least 5 10-Ks on record for {KNOWN_REGRESSION_TICKER}"
+
+    recent_filings = filings[:5]
+    year_labels = [filing["report_date"][:4] for filing in recent_filings]
+    tables = [
+        td.fetch_as_filed_statement(cik, filing["accession_number"], td.map_filing_statements(cik, filing["accession_number"])["Income Statement"])
+        for filing in recent_filings
+    ]
+
+    merged = td.merge_as_filed_statements(tables, year_labels)
+
+    def _to_number(raw) -> float | None:
+        text = str(raw).replace("$", "").replace(",", "").strip()
+        return None if text == "" else float(text)
+
+    # Adobe's own reporting changed over this window: FY2023-FY2025's own
+    # filings report a single consolidated "Revenue" line, plus a separate
+    # revenue-by-type breakdown appended to the same statement table (see
+    # test_fetch_as_filed_statement_disambiguates_axis_breakdown...);
+    # FY2021-FY2022's own filings instead break Subscription/Product/
+    # Services out directly on the face of the statement. Both eras
+    # produce their own "Subscription"-labeled row (a different concept
+    # each), so there are two here -- find the one with real, older-year
+    # values rather than assuming there's only one.
+    subscription_rows = merged.loc[merged.index == "Subscription"]
+    assert len(subscription_rows) >= 1
+    older_years = year_labels[3:]  # FY2022, FY2021
+    subscription = max(
+        (row for _, row in subscription_rows.iterrows()),
+        key=lambda row: sum(1 for y in older_years if row[y] != ""),
+    )
+    for recent_year in year_labels[:3]:  # FY2025, FY2024, FY2023
+        assert subscription[recent_year] == "", (
+            f"this Subscription row should be blank for {recent_year} (a different concept/era's row), "
+            f"got {subscription[recent_year]!r}"
+        )
+    for older_year in older_years:
+        value = _to_number(subscription[older_year])
+        # Figures are reported in $ millions (per the statement's own "$
+        # in Millions" header) -- 1000 here means $1B.
+        assert value is not None and value > 1000, (
+            f"Subscription should show a real, revenue-scale figure for {older_year}, got {subscription[older_year]!r}"
+        )
+
+    # The top-level Revenue total must stay correct across every year,
+    # including the years where breakdown rows also exist alongside it.
+    revenue_rows = merged.loc[merged.index == "Revenue"]
+    total_row = max(
+        (row for _, row in revenue_rows.iterrows()),
+        key=lambda row: sum(v for v in (_to_number(row[y]) for y in year_labels) if v is not None),
+    )
+    for year in year_labels:
+        value = _to_number(total_row[year])
+        # Same $-millions units as above -- 10000 here means $10B.
+        assert value is not None and value > 10000, (
+            f"Adobe's top-level Revenue for {year} should be a multi-billion-dollar figure, got {total_row[year]!r}"
+        )
